@@ -2,12 +2,12 @@
 #define uart_H
 
 #include <stdint.h>
-
-//Allow the UART driver to send printf text to the serial port
-//#define UART_ALLOW_DEBUG
-#define MIN_MAX_PACKETSIZE 255
-
-#define UART_BUFFERSIZE 2048
+#include "FreeRTOSConfig.h"
+#include "FreeRTOS.h"
+#include "stream_buffer.h"
+#include "UARTconfig.h"
+#include "DMA.h"
+#include "DMAutils.h"
 
 extern volatile uint8_t UART_bootloader;
 extern volatile uint32_t lastScanPosition;
@@ -16,6 +16,8 @@ extern uint8_t * UART_rxBuffer;
 typedef struct __UART_PortDescriptor__ UART_PortHandle;
 
 UART_PortHandle * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* TXPinReg, uint8_t RXPinReg);
+
+uint32_t UART_setRxDMAEnabled(UART_PortHandle * handle, uint32_t enabled);
 
 uint32_t UART_termPrint(void * port, char * format, ...);
 extern inline uint8_t UART_readChar(UART_PortHandle * handle);
@@ -27,9 +29,6 @@ extern inline unsigned UART_isOERR(UART_PortHandle * handle);
 uint32_t UART_getBaud(UART_PortHandle * handle);
 void UART_setBaud(UART_PortHandle * handle, uint64_t newBaud);
 void UART_setModuleOn(UART_PortHandle * handle, uint32_t on);
-
-
-
 
 typedef union {
   struct {
@@ -92,18 +91,31 @@ typedef union {
 } UxSTA_t;
 
 struct __UART_PortDescriptor__{
-    volatile UxMODE_t   * MODE;
-    volatile UxSTA_t    * STA;
+    volatile UxMODE_t *     MODE;
+    volatile UxSTA_t  *     STA;
     
-    volatile uint32_t   * BRG;
-    volatile uint32_t   * RXREG;
-    volatile uint32_t   * TXREG;
+    volatile uint32_t *     BRG;
+    volatile uint32_t *     RXREG;
+    volatile uint32_t *     TXREG;
     
-    volatile uint32_t   * RXR;
-    volatile uint32_t   * TXR;
+    volatile uint32_t *     RXR;
+    volatile uint32_t *     TXR;
+    
+    uint32_t rxVector;
+    uint32_t txVector;
+    uint32_t fltVector;
     
     uint32_t RXPV;
     uint32_t TXPV;
+    
+    StreamBufferHandle_t    rxStream;
+    StreamBufferHandle_t    txStream;
+    
+    uint32_t                rxRunning;
+    uint32_t                txRunning;
+    
+    DMA_RINGBUFFERHANDLE_t * rxDMAHandle;
+    DMA_HANDLE_t *          txDMAHandle;
 };
 
 #define UMODE handle->MODE->w
