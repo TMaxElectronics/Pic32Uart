@@ -51,14 +51,7 @@ UART_PortHandle * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* T
     USTAbits.UTXEN = TXPinReg != -1;
     USTAbits.URXEN = RXPinReg != -1;
     
-    //set baud rate gen
-    if(baud > 1000000){
-        UMODEbits.BRGH = 1;
-        UBRG = (configPERIPHERAL_CLOCK_HZ / (4 * baud)) - 1;
-    }else{
-        UMODEbits.BRGH = 0;
-        UBRG = (configPERIPHERAL_CLOCK_HZ / (16 * baud)) - 1;
-    }
+    UART_setBaud(handle, baud);
     
     handle->rxStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
     handle->txStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
