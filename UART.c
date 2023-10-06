@@ -11,6 +11,7 @@
 #include <sys/kmem.h>
 
 #include "UART.h"
+#include "UARTconfig.h"
 #include "FreeRTOSConfig.h"
 #include "FreeRTOS.h"
 #include "stream_buffer.h"
@@ -64,7 +65,7 @@ uint32_t UART_setRxDMAEnabled(UART_PortHandle * handle, uint32_t enabled){
     
     if(enabled){
         if(handle->rxDMAHandle == NULL){
-            handle->rxDMAHandle = DMA_createRingBuffer(UART_BUFFERSIZE, 1, handle->RXREG, handle->rxVector, 1);
+            handle->rxDMAHandle = DMA_createRingBuffer(UART_BUFFERSIZE, 1, handle->RXREG, handle->rxVector, 1, RINGBUFFER_DIRECTION_RX);
         }
     }else{
         if(handle->rxDMAHandle != NULL){
@@ -192,9 +193,9 @@ static uint32_t UART_populateDescriptor(uint32_t module, UART_PortHandle * descr
             descriptor->TXREG   = &U1TXREG;
             descriptor->RXR     = &U1RXR;
             descriptor->TXPV    = 0b0001;
-            descriptor->rxVector  = _UART1_RX_VECTOR;
-            descriptor->txVector  = _UART1_TX_VECTOR;
-            descriptor->fltVector = _UART1_FAULT_VECTOR;
+            descriptor->rxVector  = _UART1_RX_IRQ;
+            descriptor->txVector  = _UART1_TX_IRQ;
+            descriptor->fltVector = _UART1_ERR_IRQ;
             return 1;
 #endif
 #ifdef U2MODE
@@ -206,9 +207,9 @@ static uint32_t UART_populateDescriptor(uint32_t module, UART_PortHandle * descr
             descriptor->TXREG   = &U2TXREG;
             descriptor->RXR     = &U2RXR;
             descriptor->TXPV    = 0b0010;
-            descriptor->rxVector  = _UART2_RX_VECTOR;
-            descriptor->txVector  = _UART2_TX_VECTOR;
-            descriptor->fltVector = _UART2_FAULT_VECTOR;
+            descriptor->rxVector  = _UART2_RX_IRQ;
+            descriptor->txVector  = _UART2_TX_IRQ;
+            descriptor->fltVector = _UART2_ERR_IRQ;
             return 1;
 #endif
 #ifdef U3MODE

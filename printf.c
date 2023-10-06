@@ -36,8 +36,6 @@
 #include "printf.h"
 #include "FreeRTOS.h"
 #include "queue.h"
-#include "cli_basic.h"
-#include "debug.h"
 
 
 // define this globally (e.g. gcc -DPRINTF_INCLUDE_CONFIG_H ...) to include the
@@ -799,17 +797,3 @@ uint32_t stream_printf(void * port, char* format, ...){
     va_end(va);
     return 0;
 }
-
-void min_debug_prt(const char *fmt, ...){
-    if(debug_port == NULL) return;
-    port_str* port = (port_str*)debug_port->port;
-    va_list args;
-    va_start (args, fmt );
-    if(port->tx!=NULL){;
-            const out_fct_wrap_type out_fct_wrap = { &send_stream, port };
-            _vsnprintf(_out_fct, (char*)&out_fct_wrap, (size_t)-1, fmt, args);
-        }
-    va_end (args);
-}
-
-
