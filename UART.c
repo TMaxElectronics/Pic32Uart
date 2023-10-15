@@ -18,6 +18,7 @@
 #include "semphr.h"
 #include "TTerm.h"
 #include "DMAutils.h"
+#include "System.h"
 
 static uint32_t UART_populateDescriptor(uint32_t module, UART_PortHandle * descriptor);
 
@@ -93,7 +94,7 @@ static void UART_rxTask(void * params){
             while(UART_available(handle)){
                 xStreamBufferSend(handle->rxStream, URXReg, 1, portMAX_DELAY);
             }
-            vTaskDelay(1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }else{
         //TODO maybe task notification on DMA cell complete interrupt?
@@ -103,7 +104,7 @@ static void UART_rxTask(void * params){
             }
             
             DMA_RB_readSB(handle->rxDMAHandle, handle->rxStream, UART_BUFFERSIZE);
-            vTaskDelay(1);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
     handle->rxRunning = 0;
@@ -143,7 +144,17 @@ void UART_setIRQConfig(){
     
 }
 
+void UART_updateBaudForSleep(UART_PortHandle * handle, uint32_t sleep){
+    if(sleep){
+        UMODEbits.BRGH = 1;
+        UBRG = (configSECONDARY_CLOCK_HZ / (4 * handle->currentBaudrate)) - 1;
+    }else{
+        UART_setBaud(handle, handle->currentBaudrate);
+    }
+}
+
 void UART_setBaud(UART_PortHandle * handle, uint64_t newBaud){
+    handle->currentBaudrate = newBaud;
     if(newBaud > 250000){
         UMODEbits.BRGH = 1;
         UBRG = (configPERIPHERAL_CLOCK_HZ / (4 * newBaud)) - 1;
@@ -292,6 +303,7 @@ uint32_t UART_termPrint(void * port, char * format, ...){
     configASSERT(length < 256);
     
     UART_sendString((UART_PortHandle *) port, buff);
+    while(!(((UART_PortHandle *) port)->STA->TRMT));
     
     vPortFree(buff);
     

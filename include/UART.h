@@ -114,6 +114,8 @@ struct __UART_PortDescriptor__{
     uint32_t                rxRunning;
     uint32_t                txRunning;
     
+    uint32_t                currentBaudrate;
+    
     DMA_RINGBUFFERHANDLE_t * rxDMAHandle;
     DMA_HANDLE_t *          txDMAHandle;
 };
