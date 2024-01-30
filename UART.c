@@ -20,6 +20,8 @@
 #include "DMAutils.h"
 #include "System.h"
 
+#define UART_SENDEVENT(X) {uint32_t evtId = X; xStreamBufferSend(handle->eventStream, &evtId, 1, 0);}
+
 static uint32_t UART_populateDescriptor(uint32_t module, UART_PortHandle * descriptor);
 
 typedef struct{
@@ -53,10 +55,14 @@ UART_PortHandle * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* T
     USTAbits.UTXEN = TXPinReg != -1;
     USTAbits.URXEN = RXPinReg != -1;
     
+    handle->rxEnabled = (RXPinReg != -1);
+    handle->txEnabled = (TXPinReg != -1);
+    
     UART_setBaud(handle, baud);
     
     handle->rxStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
     handle->txStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
+    handle->eventStream = xStreamBufferCreate(UART_EVENTBUFFER_SIZE,0);
     
     return handle;
 }
@@ -66,7 +72,10 @@ uint32_t UART_setRxDMAEnabled(UART_PortHandle * handle, uint32_t enabled){
     
     if(enabled){
         if(handle->rxDMAHandle == NULL){
+            //initialize ringbuffer
             handle->rxDMAHandle = DMA_createRingBuffer(UART_BUFFERSIZE, 1, handle->RXREG, handle->rxVector, 1, RINGBUFFER_DIRECTION_RX);
+            //setup error interrupt for transfer abort
+            DMA_RB_setAbortIRQ(handle->rxDMAHandle, handle->fltVector, 0);
         }
     }else{
         if(handle->rxDMAHandle != NULL){
@@ -94,21 +103,48 @@ static void UART_rxTask(void * params){
             while(UART_available(handle)){
                 xStreamBufferSend(handle->rxStream, URXReg, 1, portMAX_DELAY);
             }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }else{
-        //TODO maybe task notification on DMA cell complete interrupt?
         while(UMODEbits.ON){
+            //check if UART is in an error state
             if(UART_isOERR(handle)){
+                //overrun occurred, which is weird because DMA should take care of it. Clear it but assert if debug is active
+                configASSERT(0);
+                
                 UART_clearOERR(handle);
+                
+                UART_SENDEVENT(UART_EVT_RX_ERROR_OVERFLOW);
             }
             
-            DMA_RB_readSB(handle->rxDMAHandle, handle->rxStream, UART_BUFFERSIZE);
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if(UART_isFERR(handle)){
+                //framing error occurred, clear it
+                
+                UART_clearFERR(handle);
+                
+                UART_SENDEVENT(UART_EVT_RX_ERROR_FRAMING);
+            }
+            
+            //check if dma is still running
+            if(!DMA_isEnabled(handle->rxDMAHandle->channelHandle)){
+                //some error happened and the channel was disabled... re-enable it as all errors should have been dealt with at this point
+                DMA_setEnabled(handle->rxDMAHandle->channelHandle, 1);
+            }
+            
+            //wait for data to be written to the buffer
+            if(DMA_RB_waitForData(handle->rxDMAHandle, 10000)){
+                //cool, some data was received, now write it to the buffer
+                DMA_RB_readSB(handle->rxDMAHandle, handle->rxStream, UART_BUFFERSIZE);
+            }else{
+                //timeout occured :( do nothing
+            }
         }
     }
     handle->rxRunning = 0;
-    //TODO cleanup
+    
+    //uart module was disabled => shutdown the task. There __should__ be no memory to clean up TODO make sure thats the case
+    vTaskDelete(xTaskGetCurrentTaskHandle());
+    while(1);
 }
 
 static void UART_txTask(void * params){
@@ -120,23 +156,40 @@ static void UART_txTask(void * params){
 }
 
 void UART_setModuleOn(UART_PortHandle * handle, uint32_t on){
+    //would this even change anything?
+    if(on == UMODEbits.ON) return; //lol no, just return as everything is already in the correct state anyway
+    
+    //yes, check if we are enabling or disabling the module
     if(on){
-        if(USTAbits.UTXEN){
+        //first enable the module to make sure the tasks won't just quit themselves
+        UMODEbits.ON = 1;
+        
+        //enabling, check which modes are currently enabled
+        if(handle->txEnabled){
+            //tx is on, check if txdma is in use
             //TODO enable TX Task & DMA
+            USTAbits.UTXEN = 1;
         }
         
-        if(USTAbits.URXEN){
-            //start RX ring buffer
+        if(handle->rxEnabled){
+            //rx is enabled, do we need dma?
             if(handle->rxDMAHandle != NULL){
+                //yes, reset the buffer and enable the channel
                 DMA_RB_flush(handle->rxDMAHandle);
                 DMA_setEnabled(handle->rxDMAHandle->channelHandle, 1);
             }
-            xTaskCreate(UART_rxTask, "UART rx", configMINIMAL_STACK_SIZE + 500, handle, tskIDLE_PRIORITY + 2, NULL);
+            
+            //is the rx task still running for some reason?
+            if(handle->rxRunning == 0){
+                //no, start it TODO evaluate stack size :3
+                xTaskCreate(UART_rxTask, "UART rx", configMINIMAL_STACK_SIZE + 500, handle, tskIDLE_PRIORITY + 2, NULL);
+            }
+            
+            USTAbits.URXEN = 1;
         }
-        
-        UMODEbits.ON = 1;
     }else{
-        
+        //module is to be shut down, do so. All tasks will automatically quit once the module enable gets cleared
+        UMODEbits.ON = 0;
     }
 }
 
@@ -172,11 +225,16 @@ inline unsigned UART_isOERR(UART_PortHandle * handle){
     return (USTA & _U2STA_OERR_MASK) != 0;
 }
 
+inline unsigned UART_isOn(UART_PortHandle * handle){
+    return (UMODE & _U2MODE_ON_MASK) != 0;
+}
+
 inline unsigned UART_isFERR(UART_PortHandle * handle){
     return (USTA & _U2STA_FERR_MASK) != 0;
 }
 
 inline void UART_clearOERR(UART_PortHandle * handle){
+    //TODO: evaluate if this is actually correct
     USTAbits.OERR = 0;
 }
 
@@ -296,16 +354,20 @@ uint32_t UART_termPrint(void * port, char * format, ...){
     va_list arg;
     va_start (arg, format);
     
+    uint32_t length = 0;
     
-    uint8_t * buff = (uint8_t*) pvPortMalloc(256);
-    uint32_t length = vsprintf(buff, format, arg);
-    
-    configASSERT(length < 256);
-    
-    UART_sendString((UART_PortHandle *) port, buff);
-    while(!(((UART_PortHandle *) port)->STA->TRMT));
-    
-    vPortFree(buff);
+    UART_PortHandle * handle = (UART_PortHandle *) port;
+    if(UART_isOn(handle)){
+        uint8_t * buff = (uint8_t*) pvPortMalloc(256);
+        length = vsprintf(buff, format, arg);
+
+        configASSERT(length < 256);
+
+        UART_sendString(handle, buff);
+        while(!(handle->STA->TRMT));
+
+        vPortFree(buff);
+    }
     
     va_end (arg);
     return length;

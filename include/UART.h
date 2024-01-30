@@ -9,6 +9,15 @@
 #include "DMA.h"
 #include "DMAutils.h"
 
+//UART Event defines
+#define UART_EVT_INVALID 0x00
+//module enabling/disabling events (0x1X)
+#define UART_EVT_MODULE_ENABLED 0x10
+#define UART_EVT_MODULE_DISABLED 0x11
+//error events (0x2X)
+#define UART_EVT_RX_ERROR_OVERFLOW 0x20
+#define UART_EVT_RX_ERROR_FRAMING 0x21
+
 extern volatile uint8_t UART_bootloader;
 extern volatile uint32_t lastScanPosition;
 extern uint8_t * UART_rxBuffer;
@@ -26,6 +35,7 @@ extern inline void UART_clearFERR(UART_PortHandle * handle);
 extern inline void UART_clearOERR(UART_PortHandle * handle);
 extern inline unsigned UART_isFERR(UART_PortHandle * handle);
 extern inline unsigned UART_isOERR(UART_PortHandle * handle);
+extern inline unsigned UART_isOn(UART_PortHandle * handle);
 uint32_t UART_getBaud(UART_PortHandle * handle);
 void UART_setBaud(UART_PortHandle * handle, uint64_t newBaud);
 void UART_setModuleOn(UART_PortHandle * handle, uint32_t on);
@@ -110,9 +120,12 @@ struct __UART_PortDescriptor__{
     
     StreamBufferHandle_t    rxStream;
     StreamBufferHandle_t    txStream;
+    StreamBufferHandle_t    eventStream;
     
     uint32_t                rxRunning;
+    uint32_t                rxEnabled;
     uint32_t                txRunning;
+    uint32_t                txEnabled;
     
     uint32_t                currentBaudrate;
     
