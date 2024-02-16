@@ -359,9 +359,7 @@ uint32_t UART_termPrint(void * port, char * format, ...){
     UART_PortHandle * handle = (UART_PortHandle *) port;
     if(UART_isOn(handle)){
         uint8_t * buff = (uint8_t*) pvPortMalloc(256);
-        length = vsprintf(buff, format, arg);
-
-        configASSERT(length < 256);
+        length = vsnprintf(buff, 256, format, arg);
 
         UART_sendString(handle, buff);
         while(!(handle->STA->TRMT));
