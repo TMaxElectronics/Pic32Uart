@@ -182,7 +182,7 @@ void UART_setModuleOn(UART_PortHandle * handle, uint32_t on){
             //is the rx task still running for some reason?
             if(handle->rxRunning == 0){
                 //no, start it TODO evaluate stack size :3
-                xTaskCreate(UART_rxTask, "UART rx", configMINIMAL_STACK_SIZE + 500, handle, tskIDLE_PRIORITY + 2, NULL);
+                xTaskCreate(UART_rxTask, "UART rx", configMINIMAL_STACK_SIZE + 100, handle, tskIDLE_PRIORITY + 2, NULL);
             }
             
             USTAbits.URXEN = 1;
@@ -350,6 +350,8 @@ void UART_sendString(UART_PortHandle * handle, char *data){
     }
 }
 
+static char UART_printBuffer[256];
+
 uint32_t UART_termPrint(void * port, char * format, ...){
     va_list arg;
     va_start (arg, format);
@@ -358,13 +360,10 @@ uint32_t UART_termPrint(void * port, char * format, ...){
     
     UART_PortHandle * handle = (UART_PortHandle *) port;
     if(UART_isOn(handle)){
-        uint8_t * buff = (uint8_t*) pvPortMalloc(256);
-        length = vsnprintf(buff, 256, format, arg);
+        length = vsnprintf(UART_printBuffer, 256, format, arg);
 
-        UART_sendString(handle, buff);
+        UART_sendString(handle, UART_printBuffer);
         while(!(handle->STA->TRMT));
-
-        vPortFree(buff);
     }
     
     va_end (arg);
