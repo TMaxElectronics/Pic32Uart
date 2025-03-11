@@ -22,23 +22,34 @@ extern volatile uint8_t UART_bootloader;
 extern volatile uint32_t lastScanPosition;
 extern uint8_t * UART_rxBuffer;
 
-typedef struct __UART_PortDescriptor__ UART_PortHandle;
+typedef struct __UART_PortHandle__ UartHandle_t;
 
-UART_PortHandle * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* TXPinReg, uint8_t RXPinReg);
+UartHandle_t * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* TXPinReg, uint8_t RXPinReg);
 
-uint32_t UART_setRxDMAEnabled(UART_PortHandle * handle, uint32_t enabled);
+
+//prototype of a function that can be used as an intterupt service routine
+typedef uint32_t (*UartISR_t)(UartHandle_t * handle, uint32_t flags);
+
+uint32_t UART_setRxDMAEnabled(UartHandle_t * handle, uint32_t enabled);
 
 uint32_t UART_termPrint(void * port, char * format, ...);
-extern inline uint8_t UART_readChar(UART_PortHandle * handle);
-extern inline uint32_t UART_available(UART_PortHandle * handle);
-extern inline void UART_clearFERR(UART_PortHandle * handle);
-extern inline void UART_clearOERR(UART_PortHandle * handle);
-extern inline unsigned UART_isFERR(UART_PortHandle * handle);
-extern inline unsigned UART_isOERR(UART_PortHandle * handle);
-extern inline unsigned UART_isOn(UART_PortHandle * handle);
-uint32_t UART_getBaud(UART_PortHandle * handle);
-void UART_setBaud(UART_PortHandle * handle, uint64_t newBaud);
-void UART_setModuleOn(UART_PortHandle * handle, uint32_t on);
+extern inline uint8_t UART_readChar(UartHandle_t * handle);
+extern inline uint32_t UART_isRxDataAvailable(UartHandle_t * handle);
+extern inline void UART_clearFERR(UartHandle_t * handle);
+extern inline void UART_clearOERR(UartHandle_t * handle);
+extern inline unsigned UART_isFERR(UartHandle_t * handle);
+extern inline unsigned UART_isOERR(UartHandle_t * handle);
+extern inline unsigned UART_isOn(UartHandle_t * handle);
+uint32_t UART_getBaud(UartHandle_t * handle);
+void UART_setBaud(UartHandle_t * handle, uint64_t newBaud);
+void UART_setModuleOn(UartHandle_t * handle, uint32_t on);
+
+
+
+
+
+
+
 
 typedef union {
   struct {
@@ -58,23 +69,9 @@ typedef union {
     uint32_t ON:1;
   };
   struct {
-    uint32_t :1;
-    uint32_t PDSEL0:1;
-    uint32_t PDSEL1:1;
-    uint32_t :5;
-    uint32_t UEN0:1;
-    uint32_t UEN1:1;
-  };
-  struct {
-    uint32_t :13;
-    uint32_t USIDL:1;
-    uint32_t :1;
-    uint32_t UARTEN:1;
-  };
-  struct {
     uint32_t w:32;
   };
-} UxMODE_t;
+} UartMODEbits_t;
 
 typedef union {
   struct {
@@ -98,40 +95,94 @@ typedef union {
   struct {
     uint32_t w:32;
   };
-} UxSTA_t;
+} UartSTAbits_t;
 
-struct __UART_PortDescriptor__{
-    volatile UxMODE_t *     MODE;
-    volatile UxSTA_t  *     STA;
+
+
+
+//UART module register map
+typedef struct{
+    UartMODEbits_t UMODE;
+    UartMODEbits_t UMODECLR;
+    UartMODEbits_t UMODESET;
+    UartMODEbits_t UMODEINV;
     
-    volatile uint32_t *     BRG;
-    volatile uint32_t *     RXREG;
-    volatile uint32_t *     TXREG;
+    UartSTAbits_t USTA;
+    UartSTAbits_t USTACLR;
+    UartSTAbits_t USTASET;
+    UartSTAbits_t USTAINV;
     
-    volatile uint32_t *     RXR;
-    volatile uint32_t *     TXR;
+    uint32_t TXREG;
+    uint32_t; uint32_t; uint32_t;
     
-    uint32_t rxVector;
-    uint32_t txVector;
-    uint32_t fltVector;
+    uint32_t RXREG;
+    uint32_t; uint32_t; uint32_t;
     
-    uint32_t RXPV;
-    uint32_t TXPV;
+    uint32_t BRG;
+    uint32_t BRGCLR; 
+    uint32_t BRGSET; 
+    uint32_t BRGINV;
+} UartMap_t;
+
+
+
+
+
+//timer descriptor, used in the timer array in UartConfig.c
+typedef struct{
+	UartMap_t * registerMap;
     
-    StreamBufferHandle_t    rxStream;
-    StreamBufferHandle_t    txStream;
-    StreamBufferHandle_t    eventStream;
+    Pic32SetClearMap_t * iecReg;
+    Pic32SetClearMap_t * ifsReg;
+    uint32_t   errorMask;
+    uint32_t   txMask;
+    uint32_t   rxMask;
     
-    uint32_t                rxRunning;
-    uint32_t                rxEnabled;
-    uint32_t                txRunning;
-    uint32_t                txEnabled;
+    Pic32SetClearMap_t * ipcReg;
+    uint32_t ipcOffset;
+    
+	uint32_t interruptVector;
+	uint32_t errorInterruptNumber;
+} UartDescriptor_t;
+
+
+struct __UART_PortHandle__{
+    UartDescriptor_t    *   descriptor;
+    uint32_t                number;
     
     uint32_t                currentBaudrate;
     
-    DMA_RINGBUFFERHANDLE_t * rxDMAHandle;
-    DMA_HANDLE_t *          txDMAHandle;
+    StreamBufferHandle_t    eventStream;
+    
+    SemaphoreHandle_t       txSemaphore;
+    SemaphoreHandle_t       txDmaSemaphore;
+    uint32_t                txISRFlags;
+    
+    DMA_RingBufferHandle_t * rxDMAHandle;
+    DmaHandle_t *          txDMAHandle;
+    
+    char *                  txBuffer;
+    uint32_t                txBufferPosition;
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
 
 #define UMODE handle->MODE->w
 #define UMODEbits (*handle->MODE)
@@ -147,6 +198,6 @@ struct __UART_PortDescriptor__{
 #define UTXPinValue handle->TXPV
 
 #define URXReg *(handle->RXREG)
-#define UTXReg *(handle->TXREG)
+#define UTXReg *(handle->TXREG)*/
 
 #endif
