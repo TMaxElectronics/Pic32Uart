@@ -1,4 +1,4 @@
-/**
+/*
  * @author (c) Eyal Rozenberg <eyalroz1@gmx.com>
  *             2021-2023, Haifa, Palestine/Israel
  * @author (c) Marco Paland (info@paland.com)
@@ -43,7 +43,7 @@
 #include "printf_config.h"
 #endif
 
-#include <printf/printf.h>
+#include <printf.h>
 
 #ifdef __cplusplus
 #include <cstdint>

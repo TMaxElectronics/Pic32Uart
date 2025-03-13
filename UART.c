@@ -22,68 +22,6 @@
 #include "printf.h"
 #include "Timer.h"
 
-
-
-//TODO: put this into the config file!----------------------------------------------
-
-#define UART_NUM_MODULES 2
-
-static UartDescriptor_t UART_moduleMap[UART_NUM_MODULES] = {[0 ... (UART_NUM_MODULES - 1)] = {}};
-
-//----------------------------------------------------------------------------------
-
-
-//translate macros to get the interrupt numbers for different events
-#define Uart_getErrorIRQNum(X) X->descriptor->errorInterruptNumber
-#define Uart_getRxIRQNum(X) X->descriptor->errorInterruptNumber + 1
-#define Uart_getTxIRQNum(X) X->descriptor->errorInterruptNumber + 2
-
-#define UART_DEFAULT_SEND_TIMEOUT pdMS_TO_TICKS(1000)
-
-//timeout for waiting for a transmission to finish. This MUST be longer than the longest expected transmission time
-#define UART_TIMEOUT_TX pdMS_TO_TICKS(1000)
-
-//this flag signals the transmitter routine that the transfer should be non-blocking
-#define UART_TXFLAG_NON_BLOCKING_TRANSFER 0x0001
-//this flag signals the transmitter routine that it was called from inside the library and the txSemaphore is already taken/won't need to be taken by it.
-//it also won't be returned by the dma routine unless a non-blocking transfer was requested
-#define UART_TXFLAG_INTERNAL_CALL 0x0002
-
-#define UART_REGS handle->descriptor->registerMap
-
-#define UART_EVENTFLAG_ERROR_FRAMING  0x01
-#define UART_EVENTFLAG_ERROR_PARITY   0x02
-#define UART_EVENTFLAG_ERROR_OVERFLOW 0x04
-#define UART_EVENTFLAG_ERROR_IRQ      0x08
-
-#define UART_EVENTFLAG_TX_IRQ 0x10
-#define UART_EVENTFLAG_RX_IRQ 0x20
-
-
-#define UART_isOn(handle) (UART_REGS->UMODE.w & _U2MODE_ON_MASK)
-#define UART_setOn(handle, on) (UART_REGS->UMODE.ON = on)
-
-#define UART_isOERR(handle) (UART_REGS->USTA.w & _U2STA_OERR_MASK)
-#define UART_isFERR(handle) (UART_REGS->USTA.w & _U1STA_FERR_MASK)
-#define UART_isPERR(handle) (UART_REGS->USTA.w & _U1STA_PERR_MASK)
-
-#define UART_clearOERR(handle) UART_REGS->USTACLR = _U1STA_OERR_MASK
-#define UART_clearFERR(handle) UART_REGS->USTACLR = _U1STA_FERR_MASK
-#define UART_clearPERR(handle) UART_REGS->USTACLR = _U1STA_PERR_MASK
-
-
-#define UART_getRXRegPtr(handle) &(UART_REGS->RXREG)
-#define UART_getTXRegPtr(handle) &(UART_REGS->TXREG)
-
-#define UART_isRxDataAvailable(handle) (UART_REGS->USTA.w & _U1STA_URXDA_MASK)
-#define UART_isTxBufferFull(handle) (UART_REGS->USTA.w & _U1STA_URXDA_MASK)
-
-#define UART_readChar(handle) UART_REGS->RXREG
-
-#define UART_isTxEnabled(handle) UART_REGS->USTA.UTXEN
-#define UART_isTxDMAEnabled(handle) (handle->txDMAHandle != NULL)
-
-
 typedef struct{
     UartISR_t function;
     UartHandle_t * handle;
@@ -92,91 +30,40 @@ typedef struct{
 
 static UartISRDescriptor_t isrDescriptors[UART_NUM_MODULES] = {[0 ... (UART_NUM_MODULES - 1)] = {.function = NULL, .handle = NULL}};
 
-
-
-
-static uint32_t UART_populateDescriptor(uint32_t module, UartHandle_t * descriptor);
-
-typedef struct{
-    uint16_t dataLength;
-    unsigned freeAfterSend;
-    uint8_t * data;
-} UART_SENDQUE_ELEMENT;
-
 //initializes a UART module and returns a handle for it
 //NOT: module will stay disabled until UART_setModuleOn(handle, 1); is called
-UartHandle_t * UART_init(uint32_t module, uint32_t baud, volatile uint32_t* TXPinReg, uint8_t RXPinReg){
-    UartHandle_t * handle = pvPortMalloc(sizeof(UartHandle_t));
+UartHandle_t * UART_init(uint32_t module, uint32_t baudRate){
+    //try to get memory for the handle
+    UartHandle_t * ret = UART_MALLOC(sizeof(UartHandle_t));
     
-    //prepare descriptor data
-    if(!UART_populateDescriptor(module, handle)){
-        vPortFree(handle);
-        return 0;
+    //did we get memory?
+    if(ret == NULL){
+        return NULL;
     }
     
-    handle->TXR = TXPinReg;
-    URXPinValue = RXPinReg;
+    //assign register map
+    ret->descriptor = &Uart_moduleMap[module - 1];
+    ret->number = module;
     
-    //assign IO
-    if(TXPinReg != NULL) UTXR = UTXPinValue;
-    if(RXPinReg != NULL) URXR = URXPinValue;
+    //baud rate 
+    UART_setBaud(ret, baudRate);
     
-    //initialise module    //TODO proper config functions!
+    //generate an event stream
+    ret->eventStream = xStreamBufferCreate(UART_EVENTBUFFER_SIZE,0);
     
-    UMODE = 0;
-    USTA = 0;
+    //generate semaphores for tx and reset the flags
+    ret->txSemaphore = xSemaphoreCreateBinary();
+    ret->txDmaSemaphore = xSemaphoreCreateBinary();
+    ret->txISRFlags = 0;
     
-    UART_REGS->USTA.UTXEN = TXPinReg != -1;
-    UART_REGS->USTA.URXEN = RXPinReg != -1;
+    //rx and tx dma is disabled by default, clear the pointers
+    ret->rxDMAHandle = NULL;
     
-    handle->rxEnabled = (RXPinReg != -1);
-    handle->txEnabled = (TXPinReg != -1);
+    ret->txDMAHandle = NULL;
+    ret->txBuffer;
+    ret->txBufferPosition = 0;
     
-    UART_setBaud(handle, baud);
-    
-    handle->rxStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
-    handle->txStream = xStreamBufferCreate(UART_BUFFERSIZE,0);
-    handle->eventStream = xStreamBufferCreate(UART_EVENTBUFFER_SIZE,0);
-    
-    return handle;
-}
-
-void UART_setModuleOn(UartHandle_t * handle, uint32_t on){
-    //would this even change anything?
-    if(on == UMODEbits.ON) return; //lol no, just return as everything is already in the correct state anyway
-    
-    //yes, check if we are enabling or disabling the module
-    if(on){
-        //first enable the module to make sure the tasks won't just quit themselves
-        UMODEbits.ON = 1;
-        
-        //enabling, check which modes are currently enabled
-        if(handle->txEnabled){
-            //tx is on, check if txdma is in use
-            //TODO enable TX Task & DMA
-            UART_REGS->USTA.UTXEN = 1;
-        }
-        
-        if(handle->rxEnabled){
-            //rx is enabled, do we need dma?
-            if(handle->rxDMAHandle != NULL){
-                //yes, reset the buffer and enable the channel
-                DMA_RB_flush(handle->rxDMAHandle);
-                DMA_setEnabled(handle->rxDMAHandle->channelHandle, 1);
-            }
-            
-            //is the rx task still running for some reason?
-            if(handle->rxRunning == 0){
-                //no, start it TODO evaluate stack size :3
-                xTaskCreate(UART_rxTask, "UART rx", configMINIMAL_STACK_SIZE + 100, handle, tskIDLE_PRIORITY + 2, NULL);
-            }
-            
-            UART_REGS->USTA.URXEN = 1;
-        }
-    }else{
-        //module is to be shut down, do so. All tasks will automatically quit once the module enable gets cleared
-        UMODEbits.ON = 0;
-    }
+    return ret;
 }
 
 void UART_updateBaudForSleep(UartHandle_t * handle, uint32_t sleep){
@@ -194,15 +81,15 @@ void UART_setBaud(UartHandle_t * handle, uint64_t newBaud){
     handle->currentBaudrate = newBaud;
     if(newBaud > 250000){
         UART_REGS->UMODE.BRGH = 1;
-        UART_REGS->BRG = (configPERIPHERAL_CLOCK_HZ / (4 * newBaud)) - 1;
+        UART_REGS->BRG = (UART_CLK_Hz / (4 * newBaud)) - 1;
     }else{
         UART_REGS->UMODE.BRGH = 0;
-        UART_REGS->BRG = (configPERIPHERAL_CLOCK_HZ / (16 * newBaud)) - 1;
+        UART_REGS->BRG = (UART_CLK_Hz / (16 * newBaud)) - 1;
     }
 }
 
 uint32_t UART_getBaud(UartHandle_t * handle){
-    return (configPERIPHERAL_CLOCK_HZ/ (((UART_REGS->UMODE.BRGH) ? 4 : 16) * (UART_REGS->BRG+1)));
+    return (UART_CLK_Hz/ (((UART_REGS->UMODE.BRGH) ? 4 : 16) * (UART_REGS->BRG+1)));
 }
 
 
@@ -210,21 +97,10 @@ uint32_t UART_getBaud(UartHandle_t * handle){
 //we don't use the semaphore here as this will only be called from a context where an error prevents the semaphore from being released (tx error, _general_exception_handler, vAssert, etc.)
 void UART_sendString(UartHandle_t * handle, char *data){
     while((*data) != 0){
-        while(UART_isTxBufferFull(handle));
+        while(!UART_isTxBufferFull(handle));
         UART_REGS->TXREG = *data++;
     }
 }
-
-
-
-
-
-
-
-
-
-#define UART_RW_LEAVE_UNCHANGED 0xffffffff
-
 
 //enable or disable the internal rx and tx routines
 //WARNING: when disabling the rx dma the user must ensure that no task is currently trying to read from the dma buffer as it will be freed!
@@ -270,6 +146,9 @@ uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, ui
             //yes, check if it is already on. if so we can return as there's nothing to do
             if(handle->txDMAHandle != NULL) return pdPASS;
             
+            //generate a tx buffer for printing
+            handle->txBuffer = UART_MALLOC(UART_BUFFERSIZE);
+            
             //tx is currently off and needs to be enabled. Allocate a dma channel
             DmaHandle_t * newChannel = DMA_allocateChannel();
             
@@ -282,13 +161,13 @@ uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, ui
             DMA_setInterruptConfig(newChannel, 0, 0, 0, 0, 1, 0, 1, 1); //block complete, abort and error irqs enabled
             
             //and finally set up the tx interrupt to occur as long as there is space in the tx buffer
-            UART_setTxIrqMode(handle, UART_TX_IRQ_WHEN_SPACE);
+            UART_setTxIrqMode(handle, UART_TX_IRQ_WHEN_SPACE_AVAILABLE);
             
             //finally assign the channel
             handle->txDMAHandle = newChannel;
         }else{
             //no, free the currently present ringbuffer
-
+            
             if(handle->txDMAHandle == NULL) return pdPASS; //already free'd
             
             //make sure no transmission is currently going on
@@ -301,19 +180,22 @@ uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, ui
             DMA_freeChannel(handle->txDMAHandle);
             handle->txDMAHandle = NULL;
             
+            UART_FREE(handle->txBuffer);
+            handle->txBuffer = NULL;
+            
             //return the semaphore
             xSemaphoreGive(handle->txSemaphore);
         }
     }
 }
  
-static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState){
+void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     //a uart irq just occurred, check what we need to do to handle it
     
     //is there a handle defined for the module?
-    if(isrDescriptors[moduleNumber].handle == NULL){
+    if(isrDescriptors[moduleNumber-1].handle == NULL){
         //no, switch off the timer and return
-        UART_setIRQsEnabledInternal(moduleNumber, 0);
+        UART_setIRQsEnabledInternal(moduleNumber-1, 0);
         
         return;
     }
@@ -332,15 +214,15 @@ static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState){
         
         //figure out what errors occurred and deal with them
         
-        if(UART_REGS->USTA->FERR){ //framing error, no need to reset this
+        if(UART_REGS->USTA.FERR){ //framing error, no need to reset this
             evtFlags |= UART_EVENTFLAG_ERROR_FRAMING;
         }
         
-        if(UART_REGS->USTA->PERR){ //parity error, also no need to reset this 
+        if(UART_REGS->USTA.PERR){ //parity error, also no need to reset this 
             evtFlags |= UART_EVENTFLAG_ERROR_PARITY;
         }
         
-        if(UART_REGS->USTA->OERR){ //overflow error, this will need to be reset loosing the data currently in the buffer
+        if(UART_REGS->USTA.OERR){ //overflow error, this will need to be reset loosing the data currently in the buffer
             evtFlags |= UART_EVENTFLAG_ERROR_OVERFLOW;
             
             //clear the error
@@ -379,7 +261,7 @@ uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr){
         isrDescriptors[handle->number-1].function = NULL;
     }else{
         //is there already a function assigned? If so we won't overwrite it
-        if(isrDescriptors[handle->number-1] != NULL) return pdFAIL;
+        if(isrDescriptors[handle->number-1].function != NULL) return pdFAIL;
         
         //assign the functions
         isrDescriptors[handle->number-1].function = isr;
@@ -388,7 +270,7 @@ uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr){
     return pdPASS;
 }
 
-void UART_setInterruptPriority(TimerHandle_t * handle, uint32_t priority, uint32_t subPriority){
+void UART_setInterruptPriority(UartHandle_t * handle, uint32_t priority, uint32_t subPriority){
     //we will have to perform a read-modify-write on the register to update the priority
     //since this would take forever though we utilise the pics SET and CLR registers together with a mask
     
@@ -420,9 +302,9 @@ uint32_t UART_getIRQsEnabled(UartHandle_t * handle){
 static uint32_t UART_getIRQsEnabledInternal(uint32_t moduleNumber){
     uint32_t ret = 0;
     
-    if(UART_moduleMap[moduleNumber - 1].iecReg->w & UART_moduleMap[moduleNumber - 1].rxMask) ret |= UART_EVENTFLAG_RX_IRQ;
-    if(UART_moduleMap[moduleNumber - 1].iecReg->w & UART_moduleMap[moduleNumber - 1].txMask) ret |= UART_EVENTFLAG_TX_IRQ;
-    if(UART_moduleMap[moduleNumber - 1].iecReg->w & UART_moduleMap[moduleNumber - 1].errorMask) ret |= UART_EVENTFLAG_ERROR_IRQ;
+    if(Uart_moduleMap[moduleNumber - 1].iecReg->w & Uart_moduleMap[moduleNumber - 1].rxMask) ret |= UART_EVENTFLAG_RX_IRQ;
+    if(Uart_moduleMap[moduleNumber - 1].iecReg->w & Uart_moduleMap[moduleNumber - 1].txMask) ret |= UART_EVENTFLAG_TX_IRQ;
+    if(Uart_moduleMap[moduleNumber - 1].iecReg->w & Uart_moduleMap[moduleNumber - 1].errorMask) ret |= UART_EVENTFLAG_ERROR_IRQ;
     
     return ret;
 }
@@ -439,33 +321,9 @@ void UART_setIRQsEnabled(UartHandle_t * handle, uint32_t eventIrqsEnabled){
 //internal function that can also set error irq
 static void UART_setIRQsEnabledInternal(uint32_t moduleNumber, uint32_t eventIrqsEnabled){
     //write the required bits into the iec register
-    if(eventIrqsEnabled & UART_EVENTFLAG_RX_IRQ) UART_moduleMap[moduleNumber - 1].iecReg->SET = UART_moduleMap[moduleNumber - 1].rxMask; else UART_moduleMap[moduleNumber - 1].iecReg->CLR = UART_moduleMap[moduleNumber - 1].rxMask;
-    if(eventIrqsEnabled & UART_EVENTFLAG_TX_IRQ) UART_moduleMap[moduleNumber - 1].iecReg->SET = UART_moduleMap[moduleNumber - 1].txMask; else UART_moduleMap[moduleNumber - 1].iecReg->CLR = UART_moduleMap[moduleNumber - 1].txMask;
-    if(eventIrqsEnabled & UART_EVENTFLAG_ERROR_IRQ) UART_moduleMap[moduleNumber - 1].iecReg->SET = UART_moduleMap[moduleNumber - 1].errorMask; else UART_moduleMap[moduleNumber - 1].iecReg->CLR = UART_moduleMap[moduleNumber - 1].errorMask;
-}
-
-void UART_setTxIrqMode(UartHandle_t * handle, uint32_t interruptMode){
-    
-}
-
-void UART_setRxIrqMode(UartHandle_t * handle, uint32_t interruptMode){
-    
-}
-
-void UART_setFlowControl(UartHandle_t * handle, uint32_t pinMode, uint32_t flowControlMode){
-    
-}
-            
-void UART_setOutputInvert(UartHandle_t * handle, uint32_t invertRx, uint32_t invertTx){
-    
-}
-            
-void UART_setParity(UartHandle_t * handle, uint32_t invertRx, uint32_t invertTx){
-    
-}
-            
-void UART_setStopBits(UartHandle_t * handle, uint32_t invertRx, uint32_t invertTx){
-    
+    if(eventIrqsEnabled & UART_EVENTFLAG_RX_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].rxMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].rxMask;
+    if(eventIrqsEnabled & UART_EVENTFLAG_TX_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].txMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].txMask;
+    if(eventIrqsEnabled & UART_EVENTFLAG_ERROR_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].errorMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].errorMask;
 }
 
 //function that handles the DMA interrupt when transmitting data
@@ -600,7 +458,20 @@ uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, ui
 }
 
 void UART_transmitBreak(UartHandle_t * handle){
-    //TODO
+    //is tx enabled?
+    if(!UART_isTxEnabled(handle)) return;
+    
+    //get the tx semaphore
+    if(!xSemaphoreTake(handle->txSemaphore, UART_DEFAULT_SEND_TIMEOUT)){ 
+        return;
+    }
+    
+    //transmit the break
+    UART_REGS->USTA.UTXBRK = 1;
+    UART_REGS->TXREG = 0;
+    
+    //return the semaphore
+    xSemaphoreGive(handle->txSemaphore);
 }
 
 
@@ -654,3 +525,54 @@ uint32_t UART_printf(UartHandle_t * handle, char * format, ...){
     
     return length;
 }
+
+
+
+
+//function to write a byte to the buffer
+static void UART_immediatePrintfOutputFunction(char character, void* arg){
+    //get the handle
+    UartHandle_t * handle = (UartHandle_t *) arg;
+    
+    //wait for a space in the buffer
+    while(!UART_isTxBufferFull(handle));
+    
+    //write byte into the buffer and return
+    UART_REGS->TXREG = character;
+}
+
+//printf function for the UART modules that ignores any freertos functions and just transmits out the byte right away. (Safe to use even when the rtos died)
+uint32_t UART_printfImmediate(UartHandle_t * handle, char * format, ...){
+    //start the va list
+    va_list arg;
+    va_start (arg, format);
+    
+    //is tx even enabled?
+    if(!UART_isTxEnabled(handle)) return 0;
+    
+    
+    //fill the buffer with the data to send. If a buffer overflow happens as we do this the contents of the buffer will be automatically sent out and the buffer reset
+    uint32_t length = vfctprintf(UART_immediatePrintfOutputFunction, (void*) handle, format, arg);
+    
+    //end the vaList again
+    va_end(arg);
+    
+    return length;
+}
+
+//read data out of the dma buffer into a user specified buffer
+//NOTE: this function behaves slightly differently from for example a freeRtos streambuffer read. It will wait until some data is available and read it, but not wait until {size} bytes have been read
+uint32_t UART_read(UartHandle_t * handle, char * buffer, uint32_t size, uint32_t timeout){
+    //wait for any data to be available. If some already is it will continue right away
+    if(DMA_RB_waitForData(handle->rxDMAHandle, timeout)){
+        //cool, some data was received, now write it to the buffer
+        return DMA_RB_read(handle->rxDMAHandle, buffer, size);
+    }else{
+        //timeout occured :(
+        return 0;
+    }
+}
+
+
+//definition of putchar for the printf lib, not used as there is no default module
+void putchar_(char c){}
