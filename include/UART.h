@@ -10,16 +10,6 @@
 #include "DMAutils.h"
 #include "Pic32Types.h"
 
-//UART Event defines
-#define UART_EVT_INVALID 0x00
-//module enabling/disabling events (0x1X)
-#define UART_EVT_MODULE_ENABLED 0x10
-#define UART_EVT_MODULE_DISABLED 0x11
-//error events (0x2X)
-#define UART_EVT_RX_ERROR_OVERFLOW 0x20
-#define UART_EVT_RX_ERROR_FRAMING 0x21
-
-
 //translate macros to get the interrupt numbers for different events
 #define Uart_getErrorIRQNum(X) X->descriptor->errorInterruptNumber
 #define Uart_getRxIRQNum(X) X->descriptor->errorInterruptNumber + 1
@@ -53,16 +43,13 @@
 
 #define UART_setRxIrqMode(handle, interruptMode)                UART_getRegs(handle)->USTA.URXISEL = interruptMode
 
-#define UART_setFlowControl(handle, pinMode, flowControlMode)   UART_getRegs(handle)->UMODE.UEN = flowControlMode; UART_getRegs(handle)->UMODE.RTSMD = pinMode
+#define UART_setFlowControl(handle, rtsMode, flowControlMode)   UART_getRegs(handle)->UMODE.UEN = flowControlMode; UART_getRegs(handle)->UMODE.RTSMD = rtsMode
             
-#define UART_setOutputInvert(handle, invertRx, invertTx)        UART_getRegs(handle).USTA.UTXINV = invertTx; UART_getRegs(handle).UMODE.RXINV = invertRx
+#define UART_setOutputInvert(handle, invertRx, invertTx)        UART_getRegs(handle)->USTA.UTXINV = invertTx; UART_getRegs(handle)->UMODE.RXINV = invertRx
             
 #define UART_setParity(handle, parityMode)                      UART_getRegs(handle)->UMODE.PDSEL = parityMode
           
 #define UART_setStopBits(handle, stopBits)                      { if(stopBits == 2) UART_getRegs(handle)->UMODE.STSEL = 1; else  UART_getRegs(handle)->UMODE.STSEL = 0; }
-
-#define UART_isOn(handle) (UART_getRegs(handle)->UMODE.w & _U2MODE_ON_MASK)
-#define UART_setOn(handle, on) (UART_getRegs(handle)->UMODE.ON = on)
 
 #define UART_isOERR(handle) (UART_getRegs(handle)->USTA.w & _U2STA_OERR_MASK)
 #define UART_isFERR(handle) (UART_getRegs(handle)->USTA.w & _U1STA_FERR_MASK)
@@ -80,6 +67,9 @@
 #define UART_isTxBufferFull(handle) (UART_getRegs(handle)->USTA.w & _U1STA_UTXBF_MASK)
 
 #define UART_readChar(handle) UART_getRegs(handle)->RXREG
+
+#define UART_setEnabled(handle, enabled) UART_getRegs(handle)->UMODE.ON = enabled
+#define UART_isEnabled(handle) UART_getRegs(handle)->UMODE.ON
 
 #define UART_setRxEnabled(handle, enabled) UART_getRegs(handle)->USTA.URXEN = enabled
 #define UART_isRxEnabled(handle) UART_getRegs(handle)->USTA.URXEN
@@ -101,6 +91,8 @@
 #define UART_FC_UBLCK       0b11
 #define UART_FC_CTS_AND_RTS 0b10
 #define UART_FC_RTS         0b01
+#define UART_RTSMODE_SIMPLEX        1
+#define UART_RTSMODE_FLOWCONTROL    0
 #define UART_FC_NONE        0b00
 
 #define UART_RW_LEAVE_UNCHANGED 0xffffffff
@@ -122,7 +114,7 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate);
 
 
 //prototype of a function that can be used as an intterupt service routine
-typedef uint32_t (*UartISR_t)(UartHandle_t * handle, uint32_t flags);
+typedef uint32_t (*UartISR_t)(UartHandle_t * handle, uint32_t flags, void* data);
 
 
 //initializes a UART module and returns a handle for it
@@ -147,7 +139,7 @@ void UART_setIRQsEnabled(UartHandle_t * handle, uint32_t eventIrqsEnabled);
 static uint32_t UART_getIRQsEnabledInternal(uint32_t moduleNumber);
 void UART_setInterruptPriority(UartHandle_t * handle, uint32_t priority, uint32_t subPriority);
 //assign an interrupt routine to a module. To de-assign call with isr* = NULL
-uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr);
+uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr, void * data);
 static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState);
 //enable or disable the internal rx and tx routines
 //WARNING: when disabling the rx dma the user must ensure that no task is currently trying to read from the dma buffer as it will be freed!
@@ -227,10 +219,10 @@ typedef struct{
     uint32_t USTAINV;
     
     uint32_t TXREG;
-    uint32_t; uint32_t; uint32_t;
+    unsigned : 24;  //padding three bytes that are unused in hardware
     
     uint32_t RXREG;
-    uint32_t; uint32_t; uint32_t;
+    unsigned : 24;  //padding three bytes that are unused in hardware
     
     uint32_t BRG;
     uint32_t BRGCLR; 

@@ -26,6 +26,7 @@ typedef struct{
     UartISR_t function;
     UartHandle_t * handle;
     uint32_t enabledEventFlags;
+    void * data;
 } UartISRDescriptor_t;
 
 static UartISRDescriptor_t isrDescriptors[UART_NUM_MODULES] = {[0 ... (UART_NUM_MODULES - 1)] = {.function = NULL, .handle = NULL}};
@@ -44,6 +45,11 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate){
     //assign register map
     ret->descriptor = &Uart_moduleMap[module - 1];
     ret->number = module;
+    
+    //zero out all registers
+    UART_getRegs(ret)->BRG = 0;
+    UART_getRegs(ret)->UMODE.w = 0;
+    UART_getRegs(ret)->USTA.w = 0;
     
     //baud rate 
     UART_setBaud(ret, baudRate);
@@ -192,8 +198,10 @@ uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, ui
 void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     //a uart irq just occurred, check what we need to do to handle it
     
+    UartISRDescriptor_t * isr = &isrDescriptors[moduleNumber-1];
+    
     //is there a handle defined for the module?
-    if(isrDescriptors[moduleNumber-1].handle == NULL){
+    if(isr->handle == NULL){
         //no, switch off the timer and return
         UART_setIRQsEnabledInternal(moduleNumber-1, 0);
         
@@ -201,7 +209,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     }
     
     //first get the handle
-    UartHandle_t * handle = isrDescriptors[moduleNumber-1].handle;
+    UartHandle_t * handle = isr->handle;
     
     //check what interrupt occured 
     
@@ -244,9 +252,9 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     }
     
     //now check if an isr is assigned to this module and we have an event for it
-    if(isrDescriptors[moduleNumber-1].function != NULL && (evtFlags & isrDescriptors[moduleNumber-1].enabledEventFlags) > 0){
+    if(isr->function != NULL && (evtFlags & isr->enabledEventFlags) > 0){
         //yep we have an isr and and event to dispatch to it
-        (*isrDescriptors[moduleNumber-1].function)(handle, evtFlags);
+        (*isr->function)(handle, evtFlags, isr->data);
     }
 }
 
@@ -254,7 +262,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
 
 
 //assign an interrupt routine to a module. To de-assign call with isr* = NULL
-uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr){
+uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr, void * data){
     //are we assigning or de-assigning?
     if(isr == NULL){
         //write NULL into the isr list for the function and we're done
@@ -263,8 +271,9 @@ uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr){
         //is there already a function assigned? If so we won't overwrite it
         if(isrDescriptors[handle->number-1].function != NULL) return pdFAIL;
         
-        //assign the functions
+        //assign the function and data
         isrDescriptors[handle->number-1].function = isr;
+        isrDescriptors[handle->number-1].data = data;
     }
     
     return pdPASS;
