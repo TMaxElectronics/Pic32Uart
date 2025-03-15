@@ -25,6 +25,7 @@
 //this flag signals the transmitter routine that it was called from inside the library and the txSemaphore is already taken/won't need to be taken by it.
 //it also won't be returned by the dma routine unless a non-blocking transfer was requested
 #define UART_TXFLAG_INTERNAL_CALL 0x0002
+#define UART_TXFLAG_WAITING_FOR_END 0x0004
 
 #define UART_REGS handle->descriptor->registerMap
 #define UART_getRegs(handle) handle->descriptor->registerMap
@@ -40,6 +41,7 @@
 
 
 #define UART_setTxIrqMode(handle, interruptMode)                UART_getRegs(handle)->USTA.UTXISEL = interruptMode
+#define UART_getTxIrqMode(handle)                               UART_getRegs(handle)->USTA.UTXISEL
 
 #define UART_setRxIrqMode(handle, interruptMode)                UART_getRegs(handle)->USTA.URXISEL = interruptMode
 
@@ -65,6 +67,7 @@
 
 #define UART_isRxDataAvailable(handle) (UART_getRegs(handle)->USTA.w & _U1STA_URXDA_MASK)
 #define UART_isTxBufferFull(handle) (UART_getRegs(handle)->USTA.w & _U1STA_UTXBF_MASK)
+#define UART_isTxBufferEmpty(handle) (UART_getRegs(handle)->USTA.w & _U1STA_TRMT_MASK)
 
 #define UART_readChar(handle) UART_getRegs(handle)->RXREG
 
@@ -79,6 +82,10 @@
 #define UART_isTxEnabled(handle) UART_getRegs(handle)->USTA.UTXEN
 #define UART_isTxDMAEnabled(handle) (handle->txDMAHandle != NULL)
 
+#define UART_clearTxIF(handle) handle->descriptor->ifsReg->CLR = handle->descriptor->txMask
+
+#define UART_TX_STARTED 1
+#define UART_TX_FINISHED 0
 
 #define UART_RX_IRQ_WHEN_DATA_AVAILABLE     0b00
 #define UART_RX_IRQ_WHEN_HALF_FULL          0b01
@@ -115,6 +122,7 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate);
 
 //prototype of a function that can be used as an intterupt service routine
 typedef uint32_t (*UartISR_t)(UartHandle_t * handle, uint32_t flags, void* data);
+typedef uint32_t (*UartTxCallback_t)(UartHandle_t * handle, uint32_t flags);
 
 
 //initializes a UART module and returns a handle for it
@@ -124,23 +132,17 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate);
 uint32_t UART_read(UartHandle_t * handle, char * buffer, uint32_t size, uint32_t timeout);
 uint32_t UART_printf(UartHandle_t * handle, char * format, ...);
 uint32_t UART_printfImmediate(UartHandle_t * handle, char * format, ...);
-static void UART_printfOutputFunction(char character, void* arg);
 void UART_transmitBreak(UartHandle_t * handle);
 //this function sends bytes from a buffer out on the uart line
 //IMPORTANT: if you use this function in non-blocking mode you must make sure that the buffer does not get accessed or (even worse) freed immediately after this function returns as it is still busy sending bytes
 uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, uint32_t waitTimeout, uint32_t txFlags);
-//function that handles the DMA interrupt when transmitting data
-static uint32_t UART_txDmaISR(uint32_t evt, void * data);
-//internal function that can also set error irq
-static void UART_setIRQsEnabledInternal(uint32_t moduleNumber, uint32_t eventIrqsEnabled);
+
 //sets which interrupts are enabled. The error interrupt is always on and will always call the libraries internal isr
 void UART_setIRQsEnabled(UartHandle_t * handle, uint32_t eventIrqsEnabled);
-//function to get what iec bits are set
-static uint32_t UART_getIRQsEnabledInternal(uint32_t moduleNumber);
+
 void UART_setInterruptPriority(UartHandle_t * handle, uint32_t priority, uint32_t subPriority);
 //assign an interrupt routine to a module. To de-assign call with isr* = NULL
 uint32_t UART_setISR(UartHandle_t * handle, UartISR_t isr, void * data);
-static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState);
 //enable or disable the internal rx and tx routines
 //WARNING: when disabling the rx dma the user must ensure that no task is currently trying to read from the dma buffer as it will be freed!
 uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, uint32_t txEnabled);
@@ -151,6 +153,7 @@ uint32_t UART_getBaud(UartHandle_t * handle);
 //TODO make this function make sense... we want the maximum time resolution possible to just a fixed threshold of 250kbaud
 void UART_setBaud(UartHandle_t * handle, uint64_t newBaud);
 void UART_updateBaudForSleep(UartHandle_t * handle, uint32_t sleep);
+void UART_setTxCallback(UartHandle_t * handle, UartTxCallback_t callback);
 void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState);
 
 
@@ -213,16 +216,20 @@ typedef struct{
     uint32_t UMODESET;
     uint32_t UMODEINV;
     
-    UartSTAbits_t USTA;
+    volatile UartSTAbits_t USTA;
     uint32_t USTACLR;
     uint32_t USTASET;
     uint32_t USTAINV;
     
     uint32_t TXREG;
-    unsigned : 24;  //padding three bytes that are unused in hardware
+    unsigned : 32;  //padding three bytes that are unused in hardware
+    unsigned : 32;  
+    unsigned : 32;  
     
     uint32_t RXREG;
-    unsigned : 24;  //padding three bytes that are unused in hardware
+    unsigned : 32;  //padding three bytes that are unused in hardware
+    unsigned : 32;  
+    unsigned : 32;  
     
     uint32_t BRG;
     uint32_t BRGCLR; 
@@ -236,15 +243,15 @@ typedef struct{
 
 //timer descriptor, used in the timer array in UartConfig.c
 typedef struct{
-	UartMap_t * registerMap;
+	UartMap_t * volatile registerMap;
     
-    Pic32SetClearMap_t * iecReg;
-    Pic32SetClearMap_t * ifsReg;
+    Pic32SetClearMap_t * volatile iecReg;
+    Pic32SetClearMap_t * volatile ifsReg;
     uint32_t   errorMask;
     uint32_t   txMask;
     uint32_t   rxMask;
     
-    Pic32SetClearMap_t * ipcReg;
+    Pic32SetClearMap_t * volatile ipcReg;
     uint32_t ipcOffset;
     
 	uint32_t interruptVector;
@@ -258,14 +265,20 @@ struct __UART_PortHandle__{
     
     uint32_t                currentBaudrate;
     
+    UartTxCallback_t        txCallback;
+    volatile uint32_t       txEndWaiting;
+    
     StreamBufferHandle_t    eventStream;
     
     SemaphoreHandle_t       txSemaphore;
     SemaphoreHandle_t       txDmaSemaphore;
     uint32_t                txISRFlags;
     
+    uint32_t                internalIrqs;
+    uint32_t                externalIrqs;
+    
     DMA_RingBufferHandle_t * rxDMAHandle;
-    DmaHandle_t *          txDMAHandle;
+    DmaHandle_t *           txDMAHandle;
     
     char *                  txBuffer;
     uint32_t                txBufferPosition;

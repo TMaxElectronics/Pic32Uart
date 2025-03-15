@@ -14,6 +14,7 @@
 #include "UARTconfig.h"
 #include "FreeRTOSConfig.h"
 #include "FreeRTOS.h"
+#include "task.h"
 #include "stream_buffer.h"
 #include "semphr.h"
 #include "TTerm.h"
@@ -21,6 +22,9 @@
 #include "System.h"
 #include "printf.h"
 #include "Timer.h"
+
+#define UART_getIRQsEnabledInternal(handle) handle->internalIrqs
+#define UART_txCallback(handle, evt) if(handle->txCallback != NULL) (*handle->txCallback)(handle, evt);
 
 typedef struct{
     UartISR_t function;
@@ -30,6 +34,14 @@ typedef struct{
 } UartISRDescriptor_t;
 
 static UartISRDescriptor_t isrDescriptors[UART_NUM_MODULES] = {[0 ... (UART_NUM_MODULES - 1)] = {.function = NULL, .handle = NULL}};
+
+
+static uint32_t UART_getIRQsEnabledInternalRaw(uint32_t moduleNumber);
+static void UART_setIRQsEnabledInternalRaw(uint32_t moduleNumber, uint32_t eventIrqsEnabled);
+static uint32_t UART_setIRQsEnabledInternal(UartHandle_t * handle, uint32_t eventIrqsEnabled);
+static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState);
+static void UART_printfOutputFunction(char character, void* arg);
+static uint32_t UART_txDmaISR(uint32_t evt, void * data);
 
 //initializes a UART module and returns a handle for it
 //NOT: module will stay disabled until UART_setModuleOn(handle, 1); is called
@@ -50,6 +62,7 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate){
     UART_getRegs(ret)->BRG = 0;
     UART_getRegs(ret)->UMODE.w = 0;
     UART_getRegs(ret)->USTA.w = 0;
+    ret->txCallback = NULL;
     
     //baud rate 
     UART_setBaud(ret, baudRate);
@@ -59,7 +72,9 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate){
     
     //generate semaphores for tx and reset the flags
     ret->txSemaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(ret->txSemaphore);
     ret->txDmaSemaphore = xSemaphoreCreateBinary();
+    xSemaphoreGive(ret->txDmaSemaphore);
     ret->txISRFlags = 0;
     
     //rx and tx dma is disabled by default, clear the pointers
@@ -68,6 +83,12 @@ UartHandle_t * UART_init(uint32_t module, uint32_t baudRate){
     ret->txDMAHandle = NULL;
     ret->txBuffer;
     ret->txBufferPosition = 0;
+    
+    //set the handle in the isr descriptor
+    isrDescriptors[module-1].handle = ret;
+    
+    //enable the module (not rx or tx, just the module itself)
+    UART_setEnabled(ret, 1);
     
     return ret;
 }
@@ -79,6 +100,10 @@ void UART_updateBaudForSleep(UartHandle_t * handle, uint32_t sleep){
     }else{
         UART_setBaud(handle, handle->currentBaudrate);
     }
+}
+
+void UART_setTxCallback(UartHandle_t * handle, UartTxCallback_t callback){
+    handle->txCallback = callback;
 }
 
 
@@ -102,10 +127,14 @@ uint32_t UART_getBaud(UartHandle_t * handle){
 //sends a string directly to the output buffer, incase there is some dramatic error
 //we don't use the semaphore here as this will only be called from a context where an error prevents the semaphore from being released (tx error, _general_exception_handler, vAssert, etc.)
 void UART_sendString(UartHandle_t * handle, char *data){
+    UART_txCallback(handle, UART_TX_STARTED);
+    
     while((*data) != 0){
-        while(!UART_isTxBufferFull(handle));
+        while(UART_isTxBufferFull(handle));
         UART_REGS->TXREG = *data++;
     }
+            
+    UART_txCallback(handle, UART_TX_FINISHED);
 }
 
 //enable or disable the internal rx and tx routines
@@ -131,6 +160,9 @@ uint32_t UART_setInternalRWEnabled(UartHandle_t * handle, uint32_t rxEnabled, ui
             
             //set up the rx interrupt to occur as long as there is data in the buffer
             UART_setRxIrqMode(handle, UART_RX_IRQ_WHEN_DATA_AVAILABLE);
+            
+            //enable internal irqs
+            UART_setIRQsEnabledInternal(handle, UART_EVENTFLAG_ERROR_IRQ);
             
             //assign the buffer
             handle->rxDMAHandle = newBuffer;
@@ -203,7 +235,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     //is there a handle defined for the module?
     if(isr->handle == NULL){
         //no, switch off the timer and return
-        UART_setIRQsEnabledInternal(moduleNumber-1, 0);
+        UART_setIRQsEnabledInternalRaw(moduleNumber-1, 0);
         
         return;
     }
@@ -244,6 +276,28 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     if(ifsState & handle->descriptor->txMask){
         //tx interrupt
         evtFlags |= UART_EVENTFLAG_TX_IRQ;
+        
+        //check if we were doing a transmission from our internal dma and the transfer has finished
+        if(handle->txISRFlags & UART_TXFLAG_WAITING_FOR_END){
+            //yes we need to finish the last transfer
+            handle->txISRFlags &= ~UART_TXFLAG_WAITING_FOR_END;
+            
+            //return the dma semaphore TODO add higherprioritytaskswoken again
+            xSemaphoreGiveFromISR(handle->txDmaSemaphore, NULL);
+
+            //then check if we also need to return the normal txSemaphore
+            if(handle->txISRFlags & UART_TXFLAG_NON_BLOCKING_TRANSFER){
+                //last transmission was a non-blocking one so we need to do the cleanup
+
+                //and finally return the txSemaphore
+                xSemaphoreGiveFromISR(handle->txSemaphore, NULL);
+            }
+            
+            UART_txCallback(handle, UART_TX_FINISHED);
+            
+            //disable our irq again
+            UART_setIRQsEnabledInternal(handle, UART_getIRQsEnabledInternal(handle) & ~UART_EVENTFLAG_TX_IRQ);
+        }
     }
     
     if(ifsState & handle->descriptor->rxMask){
@@ -287,8 +341,8 @@ void UART_setInterruptPriority(UartHandle_t * handle, uint32_t priority, uint32_
     UartDescriptor_t * desc = handle->descriptor;
     
     //first we make sure the interrupt is off
-    uint32_t irqsEnabled = UART_getIRQsEnabledInternal(handle->number);
-    UART_setIRQsEnabledInternal(handle, 0);
+    uint32_t irqsEnabled = UART_getIRQsEnabledInternalRaw(handle->number);
+    UART_setIRQsEnabledInternalRaw(handle->number, 0);
     
     //then we clear the priority bits. There are 5 (hence 0b11111) and located at the offset pointed to by ipcOffset
     desc->ipcReg->CLR = 0b11111 << desc->ipcOffset;
@@ -299,16 +353,11 @@ void UART_setInterruptPriority(UartHandle_t * handle, uint32_t priority, uint32_
     //after that we assign the shifted mask to the SET register to complete the operation
     desc->ipcReg->SET = map.map << desc->ipcOffset;
    
-    UART_setIRQsEnabledInternal(handle, irqsEnabled);
-}
-
-//external function, this only returns what events will cause the set isr to be called
-uint32_t UART_getIRQsEnabled(UartHandle_t * handle){
-    return isrDescriptors[handle->number-1].enabledEventFlags;
+    UART_setIRQsEnabledInternalRaw(handle->number, irqsEnabled);
 }
 
 //function to get what iec bits are set
-static uint32_t UART_getIRQsEnabledInternal(uint32_t moduleNumber){
+static uint32_t UART_getIRQsEnabledInternalRaw(uint32_t moduleNumber){
     uint32_t ret = 0;
     
     if(Uart_moduleMap[moduleNumber - 1].iecReg->w & Uart_moduleMap[moduleNumber - 1].rxMask) ret |= UART_EVENTFLAG_RX_IRQ;
@@ -318,21 +367,36 @@ static uint32_t UART_getIRQsEnabledInternal(uint32_t moduleNumber){
     return ret;
 }
 
-//sets which interrupts are enabled. The error interrupt is always on and will always call the libraries internal isr
-void UART_setIRQsEnabled(UartHandle_t * handle, uint32_t eventIrqsEnabled){
-    //call the internal function, but make sure to not disable the error interrupt
-    UART_setIRQsEnabledInternal(handle->number, eventIrqsEnabled | UART_EVENTFLAG_ERROR_IRQ);
-    
-    //then update the enabled events in the isr descriptor
-    isrDescriptors[handle->number-1].enabledEventFlags = eventIrqsEnabled;
-}
-
 //internal function that can also set error irq
-static void UART_setIRQsEnabledInternal(uint32_t moduleNumber, uint32_t eventIrqsEnabled){
+static void UART_setIRQsEnabledInternalRaw(uint32_t moduleNumber, uint32_t eventIrqsEnabled){
     //write the required bits into the iec register
     if(eventIrqsEnabled & UART_EVENTFLAG_RX_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].rxMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].rxMask;
     if(eventIrqsEnabled & UART_EVENTFLAG_TX_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].txMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].txMask;
     if(eventIrqsEnabled & UART_EVENTFLAG_ERROR_IRQ) Uart_moduleMap[moduleNumber - 1].iecReg->SET = Uart_moduleMap[moduleNumber - 1].errorMask; else Uart_moduleMap[moduleNumber - 1].iecReg->CLR = Uart_moduleMap[moduleNumber - 1].errorMask;
+}
+
+static uint32_t UART_setIRQsEnabledInternal(UartHandle_t * handle, uint32_t eventIrqsEnabled){
+    handle->internalIrqs = eventIrqsEnabled;
+    
+    //update the enable bits
+    UART_setIRQsEnabledInternalRaw(handle->number, handle->internalIrqs | handle->externalIrqs);
+}
+
+//external function, this only returns what events will cause the set isr to be called
+uint32_t UART_getIRQsEnabled(UartHandle_t * handle){
+    return handle->externalIrqs;
+}
+
+//sets which interrupts are enabled. The error interrupt is always on and will always call the libraries internal isr
+void UART_setIRQsEnabled(UartHandle_t * handle, uint32_t eventIrqsEnabled){
+    //assign this to the handle
+    handle->externalIrqs = eventIrqsEnabled;
+    
+    //update the enable bits
+    UART_setIRQsEnabledInternalRaw(handle->number, handle->internalIrqs | handle->externalIrqs);
+    
+    //then update the enabled events in the isr descriptor
+    isrDescriptors[handle->number-1].enabledEventFlags = eventIrqsEnabled;
 }
 
 //function that handles the DMA interrupt when transmitting data
@@ -348,25 +412,37 @@ static uint32_t UART_txDmaISR(uint32_t evt, void * data){
     UartHandle_t * handle = (UartHandle_t *) data;
     
     //we don't need to check which event occured, as all would be treated almost identically anyway
+    
+    //check if we need to wait until the last bit was transmitted (which is the case if a txCallback is assigned)
+    if(handle->txCallback != NULL){
+        //yes, instead of returning right away we need to continue to the tx interrupt
+        
+        //set it up
+        UART_setTxIrqMode(handle, UART_TX_IRQ_WHEN_FINAL_BYTE_SENT);
+        UART_clearTxIF(handle);
+        handle->txISRFlags |= UART_TXFLAG_WAITING_FOR_END;
+        
+        //enable it
+        UART_setIRQsEnabledInternal(handle, UART_getIRQsEnabledInternal(handle) | UART_EVENTFLAG_TX_IRQ);
+    }else{
+        //no, we can return to the code right away
+        
+        //return the dma semaphore
+        xSemaphoreGiveFromISR(handle->txDmaSemaphore, &wake1);
+        
+        //then check if we also need to return the normal txSemaphore
+        if(handle->txISRFlags & UART_TXFLAG_NON_BLOCKING_TRANSFER){
+            //last transmission was a non-blocking one so we need to do the cleanup
 
-    //return the dma semaphore
-    xSemaphoreGiveFromISR(handle->txDmaSemaphore, &wake1);
+            //and finally return the txSemaphore
+            xSemaphoreGiveFromISR(handle->txSemaphore, &wake2);
+        }
+    }
 
     //clean up dma
     DMA_setIRQEnabled(handle->txDMAHandle, 0);
     if(evt & DMA_EVTFLAG_ADDRERR) DMA_abortTransfer(handle->txDMAHandle); //if some address error was detected we want to abort the transfer. Any other event thats enabled already does this by itself
 
-    //then check if we also need to return the normal txSemaphore
-    if(handle->txISRFlags & UART_TXFLAG_NON_BLOCKING_TRANSFER){
-        //last transmission was a non-blocking one so we need to do the cleanup
-
-        //clear the txEn pin if needed
-        //TODO: clear txEn
-
-        //and finally return the txSemaphore
-        xSemaphoreGiveFromISR(handle->txSemaphore, &wake2);
-    }
-    
     //TODO: the way this is implemented right now the user won't be able to know if something went wrong with the transmission after dma was started unless a timeout occurs instead of a dma error (which is pretty unlikely)
     
     portEND_SWITCHING_ISR(wake1 || wake2);
@@ -384,8 +460,6 @@ uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, ui
     
     //WARNING TO ME: from this point on any return from this function must ensure that the txSemaphore gets returned!
     
-    
-    
     //we also have to take the txDmaSemaphore, which is used to signal completion of a transmission
     if(!xSemaphoreTake(handle->txDmaSemaphore, waitTimeout)){ 
         //This is a state that should never be reached! The only time that the txSemaphore is returned is when a transmission has completed, at which point the txDmaSemaphore MUST also be returned
@@ -396,15 +470,18 @@ uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, ui
         return 0;
     }
     
+    //set the uart tx interrupt
+    UART_setTxIrqMode(handle, UART_TX_IRQ_WHEN_SPACE_AVAILABLE);
+    
     //tell the dma interrupt any flags that might be set. We can safely write this here as the interrupt is still disabled
     handle->txISRFlags = txFlags;
     
     //is software txEn control enabled? If so we now set the txEn pin
-    //TODO: set txEn pin
+    UART_txCallback(handle, UART_TX_STARTED);
     
     //now we set up the txDMA
     DMA_setSrcConfig(handle->txDMAHandle, buffer, size);    //transmit all bytes out of our buffer
-    DMA_setTransferAttributes(handle, 1, Uart_getTxIRQNum(handle), DMA_IRQ_DISABLED);    //transfer one byte on every assertion of our uart interrupt
+    DMA_setTransferAttributes(handle->txDMAHandle, 1, Uart_getTxIRQNum(handle), DMA_IRQ_DISABLED);    //transfer one byte on every assertion of our uart interrupt
     
     DMA_clearGloablIF(handle->txDMAHandle);     //reset the interrupt flag just incase even if it isn't persistent
     DMA_setIRQEnabled(handle->txDMAHandle, 1);  //enable interrupts
@@ -430,7 +507,7 @@ uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, ui
     //yep we should block. Just wait until the semaphore is returned
     if(!xSemaphoreTake(handle->txDmaSemaphore, UART_TIMEOUT_TX)){
         //whatever we do we want to clear the txEn asap! If txEn is used we have probably already blocked for a while at this point.
-        //TODO: clear txEn pin
+        UART_txCallback(handle, UART_TX_FINISHED);
         
         //This state should also never be reachable! If it is reached make sure your timeout is sufficient for the longest transmission that will happen
         //We should never get here as the txDmaSemaphore is returned in the dma complete or dma error interrupt, which MUST occur after the transmission completes or fails
@@ -455,11 +532,11 @@ uint32_t UART_sendBuffer(UartHandle_t * handle, char * buffer, uint32_t size, ui
     }
     
     //txDma interrupt triggered :D Now check if the transfer was successful
-    //TODO: add flag that states wether a transfer was successful or not
+    //TODO: add flag that states whether a transfer was successful or not
     
-    //all done, clear txEn and return both semaphores :)
-    //TODO: clear txEn pin
+    //NOTE: the tx callback is triggered from the uart tx interrupt
     
+    //all done, return both semaphores :)
     xSemaphoreGive(handle->txDmaSemaphore);
     if(!(txFlags & UART_TXFLAG_INTERNAL_CALL)) xSemaphoreGive(handle->txSemaphore);
     
@@ -475,9 +552,15 @@ void UART_transmitBreak(UartHandle_t * handle){
         return;
     }
     
+    UART_txCallback(handle, UART_TX_STARTED);
+    
     //transmit the break
     UART_REGS->USTA.UTXBRK = 1;
     UART_REGS->TXREG = 0;
+    
+    while(UART_REGS->USTA.UTXBRK);
+    
+    UART_txCallback(handle, UART_TX_FINISHED);
     
     //return the semaphore
     xSemaphoreGive(handle->txSemaphore);
@@ -502,6 +585,43 @@ static void UART_printfOutputFunction(char character, void* arg){
     }
 }
 
+//function to write a byte to the buffer
+static void UART_immediatePrintfOutputFunction(char character, void* arg){
+    //get the handle
+    UartHandle_t * handle = (UartHandle_t *) arg;
+    
+    //wait for a space in the buffer
+    while(UART_isTxBufferFull(handle));
+    
+    //write byte into the buffer and return
+    UART_REGS->TXREG = character;
+}
+
+uint32_t UART_vfctprintfInternal(UartHandle_t * handle, void (*out)(char c, void* extra_arg), void* extra_arg, const char* format, va_list arg){
+    //first set up the txen
+    
+    //set up interrupt config and clear flag
+    uint32_t intConf = UART_getTxIrqMode(handle);
+    UART_setTxIrqMode(handle, UART_TX_IRQ_WHEN_FINAL_BYTE_SENT);
+        
+    //set the tx enable
+    UART_txCallback(handle, UART_TX_STARTED);
+    
+    //transmit data
+    uint32_t length = vfctprintf(UART_immediatePrintfOutputFunction, (void*) handle, format, arg);
+    handle->descriptor->ifsReg->CLR = handle->descriptor->txMask;
+    
+    //wait until final byte is sent
+    while(!(handle->descriptor->ifsReg->w & handle->descriptor->txMask));
+    UART_txCallback(handle, UART_TX_FINISHED);
+    
+    //restore interrupt config
+    UART_setTxIrqMode(handle, intConf);
+    return length;
+}
+
+
+
 //printf function for the UART modules
 uint32_t UART_printf(UartHandle_t * handle, char * format, ...){
     //start the va list
@@ -509,7 +629,36 @@ uint32_t UART_printf(UartHandle_t * handle, char * format, ...){
     va_start (arg, format);
     
     //is tx even enabled?
-    if(!(UART_isTxEnabled(handle) && UART_isTxDMAEnabled(handle))) return 0;
+    if(!(UART_isTxEnabled(handle) && UART_isTxDMAEnabled(handle))){ 
+        //end the vaList again
+        va_end(arg);
+        
+        return 0;
+    }
+    
+    //check if the scheduler is running. If not we need to fall back to the scheduler independent printf
+    if(xTaskGetSchedulerState() != taskSCHEDULER_RUNNING){
+        uint32_t length = UART_vfctprintfInternal(handle, UART_immediatePrintfOutputFunction, (void*) handle, format, arg);
+        
+        //end the vaList again
+        va_end(arg);
+        
+        return length;
+    }
+    
+    //are we in a critical section? If so we won't transmit anything as a non blocking transmit relies on interrups
+    //which are disabled in taskENTER_CRITICAL() and a blocking transmit in a critical section would impact system
+    //real-time-nes due to the time it would take to transmit. If you want to do this anyway then use the printfImmediate
+    //function
+    if(xTaskIsInCriticalSection()){
+        //notify user in debug mode
+        configASSERT(0);
+        
+        //end the vaList again
+        va_end(arg);
+        
+        return 0;
+    }
     
     //try to get the semaphore
     if(!xSemaphoreTake(handle->txSemaphore, UART_DEFAULT_SEND_TIMEOUT)) return 0;
@@ -535,21 +684,6 @@ uint32_t UART_printf(UartHandle_t * handle, char * format, ...){
     return length;
 }
 
-
-
-
-//function to write a byte to the buffer
-static void UART_immediatePrintfOutputFunction(char character, void* arg){
-    //get the handle
-    UartHandle_t * handle = (UartHandle_t *) arg;
-    
-    //wait for a space in the buffer
-    while(!UART_isTxBufferFull(handle));
-    
-    //write byte into the buffer and return
-    UART_REGS->TXREG = character;
-}
-
 //printf function for the UART modules that ignores any freertos functions and just transmits out the byte right away. (Safe to use even when the rtos died)
 uint32_t UART_printfImmediate(UartHandle_t * handle, char * format, ...){
     //start the va list
@@ -557,12 +691,16 @@ uint32_t UART_printfImmediate(UartHandle_t * handle, char * format, ...){
     va_start (arg, format);
     
     //is tx even enabled?
-    if(!UART_isTxEnabled(handle)) return 0;
-    
+    if(!UART_isTxEnabled(handle)){ 
+        //end the vaList again
+        va_end(arg);
+        
+        return 0;
+    }
     
     //fill the buffer with the data to send. If a buffer overflow happens as we do this the contents of the buffer will be automatically sent out and the buffer reset
-    uint32_t length = vfctprintf(UART_immediatePrintfOutputFunction, (void*) handle, format, arg);
-    
+    uint32_t length = UART_vfctprintfInternal(handle, UART_immediatePrintfOutputFunction, (void*) handle, format, arg);
+
     //end the vaList again
     va_end(arg);
     
