@@ -15,7 +15,7 @@ const UartDescriptor_t Uart_moduleMap[UART_NUM_MODULES] =
 #ifdef U1MODE
     void __ISR(_UART1_VECTOR) U1ISR(){ 
         uint32_t ifsState = IFS1;
-        IFS1CLR = _IFS1_U1RXIF_MASK;
+        IFS1CLR = _IFS1_U1RXIF_MASK | _IFS1_U1TXIF_MASK | _IFS1_U1EIF_MASK;
         UART_isrHandler(1, ifsState);
     } 
 #endif 
@@ -23,7 +23,7 @@ const UartDescriptor_t Uart_moduleMap[UART_NUM_MODULES] =
 #ifdef U2MODE
     void __ISR(_UART2_VECTOR) U2ISR(){ 
         uint32_t ifsState = IFS1;
-        IFS1CLR = _IFS1_U2RXIF_MASK;
+        IFS1CLR = _IFS1_U2RXIF_MASK | _IFS1_U2TXIF_MASK | _IFS1_U2EIF_MASK;
         UART_isrHandler(2, ifsState);
     } 
 #endif 

@@ -245,7 +245,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     
     //check what interrupt occured 
     
-    uint32_t evtFlags = 0;
+    uint8_t evtFlags = 0;
     
     if(ifsState & handle->descriptor->errorMask){
         //error interrupt. get the error type(s) and push a notification into the handle's event queue
@@ -254,11 +254,11 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
         
         //figure out what errors occurred and deal with them
         
-        if(UART_REGS->USTA.FERR){ //framing error, no need to reset this
+        if(UART_REGS->USTA.FERR){ //framing error, clear error byte from the buffer
             evtFlags |= UART_EVENTFLAG_ERROR_FRAMING;
         }
         
-        if(UART_REGS->USTA.PERR){ //parity error, also no need to reset this 
+        if(UART_REGS->USTA.PERR){ //parity error, clear error byte from the buffer
             evtFlags |= UART_EVENTFLAG_ERROR_PARITY;
         }
         
