@@ -24,7 +24,6 @@
 #include "Timer.h"
 
 #define UART_getIRQsEnabledInternal(handle) handle->internalIrqs
-#define UART_txCallback(handle, evt) if(handle->txCallback != NULL) (*handle->txCallback)(handle, evt);
 
 typedef struct{
     UartISR_t function;
@@ -251,6 +250,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
         //error interrupt. get the error type(s) and push a notification into the handle's event queue
         
         evtFlags |= UART_EVENTFLAG_ERROR_IRQ;
+        UART_clearErrorIF(handle);
         
         //figure out what errors occurred and deal with them
         
@@ -276,6 +276,7 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     if(ifsState & handle->descriptor->txMask){
         //tx interrupt
         evtFlags |= UART_EVENTFLAG_TX_IRQ;
+        UART_clearTxIF(handle);
         
         //check if we were doing a transmission from our internal dma and the transfer has finished
         if(handle->txISRFlags & UART_TXFLAG_WAITING_FOR_END){
@@ -303,10 +304,14 @@ void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState){
     if(ifsState & handle->descriptor->rxMask){
         //rx interrupt
         evtFlags |= UART_EVENTFLAG_RX_IRQ;
+        UART_clearRxIF(handle);
     }
     
+    //make sure that we only deliver events that the function wants to receive
+    evtFlags &= isr->enabledEventFlags;
+    
     //now check if an isr is assigned to this module and we have an event for it
-    if(isr->function != NULL && (evtFlags & isr->enabledEventFlags) > 0){
+    if(isr->function != NULL && evtFlags){
         //yep we have an isr and and event to dispatch to it
         (*isr->function)(handle, evtFlags, isr->data);
     }

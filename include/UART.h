@@ -82,7 +82,11 @@
 #define UART_isTxEnabled(handle) UART_getRegs(handle)->USTA.UTXEN
 #define UART_isTxDMAEnabled(handle) (handle->txDMAHandle != NULL)
 
+#define UART_clearErrorIF(handle) handle->descriptor->ifsReg->CLR = handle->descriptor->errorMask
+#define UART_clearRxIF(handle) handle->descriptor->ifsReg->CLR = handle->descriptor->rxMask
 #define UART_clearTxIF(handle) handle->descriptor->ifsReg->CLR = handle->descriptor->txMask
+
+#define UART_txCallback(handle, evt) if(handle->txCallback != NULL) (*handle->txCallback)(handle, evt);
 
 #define UART_TX_STARTED 1
 #define UART_TX_FINISHED 0
