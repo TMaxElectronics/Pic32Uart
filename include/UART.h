@@ -161,6 +161,7 @@ void UART_setTxCallback(UartHandle_t * handle, UartTxCallback_t callback);
 void UART_isrHandler(uint32_t moduleNumber, uint32_t ifsState);
 
 
+char UART_getParityLetter(uint32_t bitValue);
 
 
 

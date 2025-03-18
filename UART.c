@@ -728,3 +728,16 @@ uint32_t UART_read(UartHandle_t * handle, char * buffer, uint32_t size, uint32_t
 
 //definition of putchar for the printf lib, not used as there is no default module
 void putchar_(char c){}
+
+
+
+//get the character describing parity mode from a parity bit setting
+char UART_getParityLetter(uint32_t bitValue){
+    switch(bitValue){
+        case UART_PARITY_NONE: return 'N';
+        case UART_PARITY_EVEN: return 'E';
+        case UART_PARITY_ODD: return 'O';
+        case UART_PARITY_9BIT: return '9';
+    }
+    return 'I';
+}
