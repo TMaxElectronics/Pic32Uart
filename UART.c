@@ -38,7 +38,6 @@ static UartISRDescriptor_t isrDescriptors[UART_NUM_MODULES] = {[0 ... (UART_NUM_
 static uint32_t UART_getIRQsEnabledInternalRaw(uint32_t moduleNumber);
 static void UART_setIRQsEnabledInternalRaw(uint32_t moduleNumber, uint32_t eventIrqsEnabled);
 static uint32_t UART_setIRQsEnabledInternal(UartHandle_t * handle, uint32_t eventIrqsEnabled);
-static void UART_handleInterrupt(uint32_t moduleNumber, uint32_t ifsState);
 static void UART_printfOutputFunction(char character, void* arg);
 static uint32_t UART_txDmaISR(uint32_t evt, void * data);
 
