@@ -21,7 +21,6 @@
 #include "DMAutils.h"
 #include "System.h"
 #include "printf.h"
-#include "Timer.h"
 
 #define UART_getIRQsEnabledInternal(handle) handle->internalIrqs
 
